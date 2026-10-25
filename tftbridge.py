@@ -54,6 +54,10 @@ class TftBridge:
         self.autoreport_timer = self.reactor.register_timer(
             self._autoreport_event)
         self.busy_timer = self.reactor.register_timer(self._busy_event)
+        # The USB serial adapter can show up after Klipper starts (boot order,
+        # screen powered later), so a failed open is retried until it works.
+        self.reconnect_timer = self.reactor.register_timer(
+            self._reconnect_event)
 
         # Host print detection: the TFT only polls M27 (progress) once it has
         # been told a print is active via a "File opened:" notification.
@@ -71,6 +75,13 @@ class TftBridge:
     # Lifecycle
     # ------------------------------------------------------------------ #
     def _handle_ready(self):
+        self._open_tft()
+
+    def _reconnect_event(self, eventtime):
+        self._open_tft()
+        return self.reactor.NEVER if self.tft is not None else eventtime + 5.
+
+    def _open_tft(self):
         if self.tft is not None:
             return
         try:
@@ -78,8 +89,11 @@ class TftBridge:
             # bytes are available on the fd.
             self.tft = serial.Serial(self.tft_device, self.tft_baud, timeout=0)
         except Exception:
-            logging.exception("TFTBridge: cannot open %s", self.tft_device)
+            logging.warning("TFTBridge: cannot open %s, retrying in 5s",
+                            self.tft_device)
             self.tft = None
+            self.reactor.update_timer(self.reconnect_timer,
+                                      self.reactor.monotonic() + 5.)
             return
         self.fd_handle = self.reactor.register_fd(self.tft.fileno(),
                                                   self._tft_readable)
@@ -92,6 +106,7 @@ class TftBridge:
         logging.info("TFTBridge: ready, listening on %s", self.tft_device)
 
     def _handle_disconnect(self):
+        self.reactor.update_timer(self.reconnect_timer, self.reactor.NEVER)
         self.reactor.update_timer(self.busy_timer, self.reactor.NEVER)
         self.reactor.update_timer(self.autoreport_timer, self.reactor.NEVER)
         self.reactor.update_timer(self.printwatch_timer, self.reactor.NEVER)
