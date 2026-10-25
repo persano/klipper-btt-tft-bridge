@@ -55,6 +55,8 @@ The TFT is **not** wired to the mainboard's TFT port. It's a plain serial device
 
 ## Install
 
+Quick way: `git clone` this repo on the Pi and run `./install.sh [klipper_dir]`. It symlinks the module and adds the git exclude below, so `git pull` updates it. If the serial adapter is not ready when Klipper starts, the bridge retries opening it every 5 s.
+
 ### 1. Klipper module
 Copy `tftbridge.py` to your Klipper extras folder:
 ```bash
