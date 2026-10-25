@@ -1,0 +1,15 @@
+# Macros for Marlin commands the BTT TFT sends that Klipper has no equivalent for.
+# Needs [pause_resume] for PAUSE.
+
+# TFT "power off" / shutdown-after-print. Heaters and fan off, motors released.
+# Add your own power-relay command here if you have one.
+[gcode_macro M81]
+gcode:
+    TURN_OFF_HEATERS
+    M107
+    M84
+
+# Filament change: pause the print, then use the TFT's load/unload menu.
+[gcode_macro M600]
+gcode:
+    PAUSE

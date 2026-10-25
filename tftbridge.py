@@ -22,6 +22,20 @@ import logging
 import serial
 
 
+# Marlin settings/query commands the TFT sends from its menus that Klipper has
+# no equivalent for. Acked quietly instead of showing an "Unknown command"
+# error toast on the screen.
+QUIET_ACK = frozenset(
+    'M22 M33 M36 M43 M92 M98 M125 M141 M154 M200 M201 M203 M205 M206 M207 '
+    'M208 M209 M211 M218 M291 M292 M300 M301 M304 M306 M355 M376 M408 M409 '
+    'M500 M501 M502 M503 M552 M564 M569 M593 M665 M666 M710 M876 M906 M913 '
+    'M914 M928'.split())
+
+# M280 P0 S<angle> servo angles the TFT BLTouch menu uses -> BLTOUCH_DEBUG.
+BLTOUCH_ANGLES = {10: 'pin_down', 60: 'touch_mode', 90: 'pin_up',
+                  120: 'reset', 130: 'self_test'}
+
+
 class TftBridge:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -224,12 +238,15 @@ class TftBridge:
             return
 
         # --- quietly acked: Klipper has no equivalent / no-op ---
-        if cmd in ('M92', 'M211', 'M500', 'M501', 'M502', 'M503'):
+        if cmd in QUIET_ACK:
             self._send('ok\r\n')
             return
 
         # --- Marlin -> Klipper translations ---
         translated = self._translate(cmd, text)
+        if translated == '':
+            self._send('ok\r\n')  # recognised, nothing to do in Klipper
+            return
         if translated is not None:
             self.cmd_queue.append(translated)
             return
@@ -255,6 +272,41 @@ class TftBridge:
             return 'PAUSE'
         if cmd == 'M524':
             return 'CANCEL_PRINT'
+        if cmd == 'M290':
+            # Babystep menu: relative Z move, applied live.
+            z = self._param(text, 'Z')
+            if z is None:
+                return ''
+            return 'SET_GCODE_OFFSET Z_ADJUST=%.3f MOVE=1' % z
+        if cmd == 'M280':
+            # BLTouch menu. Other servos have no Klipper equivalent.
+            angle = self._param(text, 'S')
+            action = BLTOUCH_ANGLES.get(int(angle)) if angle is not None                 else None
+            if self._param(text, 'P') == 0. and action:
+                return 'BLTOUCH_DEBUG COMMAND=%s' % action
+            return ''
+        if cmd == 'M401':
+            # Plain M401 deploys; "M401 H"/"M401 S" are BLTouch HS-mode
+            # queries/settings Klipper does not have.
+            if len(text.split()) > 1:
+                return ''
+            return 'BLTOUCH_DEBUG COMMAND=pin_down'
+        if cmd == 'M402':
+            return 'BLTOUCH_DEBUG COMMAND=pin_up'
+        if cmd == 'M48':
+            return 'PROBE_ACCURACY'
+        if cmd == 'M303':
+            # PID autotune from the Tune menu: E<heater> (-1 = bed) S<target>.
+            target = self._param(text, 'S')
+            if target is None:
+                return ''
+            heater = 'heater_bed' if self._param(text, 'E') == -1.                 else 'extruder'
+            return 'PID_CALIBRATE HEATER=%s TARGET=%d' % (heater, target)
+        if cmd == 'M900':
+            k = self._param(text, 'K')
+            if k is None:
+                return ''
+            return 'SET_PRESSURE_ADVANCE ADVANCE=%.4f' % k
         return None
 
     # ------------------------------------------------------------------ #

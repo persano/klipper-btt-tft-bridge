@@ -35,3 +35,20 @@ assert sent == ['//action:notification Data Left 50/100\r\n'
 b._report_progress('paused', 50, 100)
 assert b.progress_sent is None
 print('ok progress')
+
+# Marlin -> Klipper translations of commands the TFT menus emit
+t = tftbridge.TftBridge.__new__(tftbridge.TftBridge)
+for line, want in [
+        ('M290 Z0.05', 'SET_GCODE_OFFSET Z_ADJUST=0.050 MOVE=1'),
+        ('M280 P0 S10', 'BLTOUCH_DEBUG COMMAND=pin_down'),
+        ('M280 P0 S90', 'BLTOUCH_DEBUG COMMAND=pin_up'),
+        ('M280 P1 S90', ''), ('M401', 'BLTOUCH_DEBUG COMMAND=pin_down'),
+        ('M401 H', ''), ('M48', 'PROBE_ACCURACY'),
+        ('M303 E-1 S60 C8', 'PID_CALIBRATE HEATER=heater_bed TARGET=60'),
+        ('M303 E0 S200', 'PID_CALIBRATE HEATER=extruder TARGET=200'),
+        ('M900 K0.05', 'SET_PRESSURE_ADVANCE ADVANCE=0.0500'),
+        ('M104 S200', None)]:
+    got = t._translate(line.split()[0], line)
+    assert got == want, (line, got)
+assert 'M203' in tftbridge.QUIET_ACK
+print('ok translate')
