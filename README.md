@@ -181,3 +181,18 @@ MIT — see [LICENSE](LICENSE).
 - **Macros:** `examples/macros.cfg.example` has `M81` (power off) and `M600` (filament change) for commands the TFT sends that Klipper does not know.
 - **Not supported:** `G30` (the TFT's manual-leveling points), `G26`, `G33`/`G34`, `G42`, `M421` and the TMC/RepRap-specific commands still reach Klipper and show an error on the screen.
 
+## Updates from Mainsail / Fluidd
+
+Clone the repo, run `./install.sh`, then add this to `moonraker.conf` so the update manager shows it in the web UI and restarts Klipper after an update:
+
+```
+[update_manager klipper-btt-tft-bridge]
+type: git_repo
+path: ~/klipper-btt-tft-bridge
+origin: https://github.com/persano/klipper-btt-tft-bridge.git
+primary_branch: main
+managed_services: klipper
+```
+
+With two Klipper instances sharing one clone, add it to one Moonraker only and use the matching `klipper-<name>` service in `managed_services`.
+
