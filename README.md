@@ -175,4 +175,6 @@ MIT — see [LICENSE](LICENSE).
 - **Serial retry:** if the screen's serial port can't be opened at start-up, it is retried every 5 s.
 - **Other TFT models (TFT24/28/35, V1-V3):** the module is model-independent. Use the TFT's own firmware and `config.ini` with the same settings: Marlin mode, Touch Mode, the baud rate you set in `tft_baud`, and host `M155` auto-report enabled.
 - **Not covered:** switching the screen off when the printer is off (oldhui-uk/tftbridge#9) needs a relay or GPIO, which Klipper can switch with `[output_pin]`; the module can't do it by itself.
+- **Time left / data left:** while printing, the bridge sends `//action:notification Time Left ..` and `Data Left ..` (the same host actions [btt-tft-postprocess](https://github.com/persano/btt-tft-postprocess) injects for Marlin hosts), so those tiles fill without editing the gcode. The estimate is linear in file position, so it is rough early in a print. Thumbnails still need the file itself, which this bridge does not stream.
+- **Screen firmware:** for the Artillery Genius Pro's MKS GD TFT28 (GD32F305), a build with serial/notification fixes is in [persano/BIGTREETECH-TFT](https://github.com/persano/BIGTREETECH-TFT) (branch `btt-tft28-GD32F305-artillery-genius-pro`).
 

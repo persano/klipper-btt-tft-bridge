@@ -103,6 +103,7 @@ class TftBridge:
         self.print_state = None
         self.fan_sent = None
         self.msg_sent = ''
+        self.progress_sent = None
         self.reactor.update_timer(self.printwatch_timer,
                                   self.reactor.monotonic() + 1.)
         logging.info("TFTBridge: ready, listening on %s", self.tft_device)
@@ -395,6 +396,7 @@ class TftBridge:
             return self.reactor.NEVER
         self._report_fan_and_message()
         state, filename, pos, size = self._print_info()
+        self._report_progress(state, pos, size)
         if state != self.print_state:
             prev = self.print_state
             self.print_state = state
@@ -430,6 +432,31 @@ class TftBridge:
             if msg and msg != self.msg_sent:
                 self._send('echo:%s\r\n' % msg)
             self.msg_sent = msg
+
+    def _report_progress(self, state, pos, size):
+        # Same host actions the BTT slicer post-processor emits via M118: they
+        # fill the TFT's "time left" and "data left" tiles.
+        if state != 'printing' or size <= 0:
+            self.progress_sent = None
+            return
+        pct = int(100. * pos / size)
+        # shortcut: time left is linear in file position, so it is rough on
+        # prints with a slow start (first layers); upgrade to slicer M73 R.
+        ps = self.printer.lookup_object('print_stats', None)
+        try:
+            elapsed = ps.get_status(self.reactor.monotonic())['print_duration']
+        except Exception:
+            return
+        if pct < 1 or pos <= 0:
+            return
+        left = int(elapsed * (size - pos) / pos)
+        key = (pct, left // 60)
+        if key == self.progress_sent:
+            return
+        self.progress_sent = key
+        self._send('//action:notification Data Left %d/100\r\n'
+                   '//action:notification Time Left %02dh%02dm%02ds\r\n'
+                   % (pct, left // 3600, left // 60 % 60, left % 60))
 
     def _m115_report(self):
         caps = [
