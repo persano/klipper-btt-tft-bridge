@@ -101,6 +101,8 @@ class TftBridge:
             self.gcode.register_output_handler(self._relay_klipper_output)
             self.output_hooked = True
         self.print_state = None
+        self.fan_sent = None
+        self.msg_sent = ''
         self.reactor.update_timer(self.printwatch_timer,
                                   self.reactor.monotonic() + 1.)
         logging.info("TFTBridge: ready, listening on %s", self.tft_device)
@@ -391,6 +393,7 @@ class TftBridge:
         # (progress) after it is told a print is active via "File opened:".
         if self.tft is None:
             return self.reactor.NEVER
+        self._report_fan_and_message()
         state, filename, pos, size = self._print_info()
         if state != self.print_state:
             prev = self.print_state
@@ -404,6 +407,29 @@ class TftBridge:
                 self._send('Done printing file\r\n')
                 logging.info("TFTBridge: print complete -> Done printing file")
         return eventtime + 1.
+
+    def _report_fan_and_message(self):
+        # The TFT only learns fan speed from an "M106 P0 S<n>" line, and shows
+        # "echo:" lines as notifications, so push both when Klipper changes them.
+        now = self.reactor.monotonic()
+        fan = self.printer.lookup_object('fan', None)
+        if fan is not None:
+            try:
+                pwm = int(round(fan.get_status(now)['speed'] * 255.))
+            except Exception:
+                pwm = None
+            if pwm is not None and pwm != self.fan_sent:
+                self.fan_sent = pwm
+                self._send('M106 P0 S%d\r\n' % pwm)
+        ds = self.printer.lookup_object('display_status', None)
+        if ds is not None:
+            try:
+                msg = (ds.get_status(now)['message'] or '').replace('\n', ' ')
+            except Exception:
+                msg = ''
+            if msg and msg != self.msg_sent:
+                self._send('echo:%s\r\n' % msg)
+            self.msg_sent = msg
 
     def _m115_report(self):
         caps = [

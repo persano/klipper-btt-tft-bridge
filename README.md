@@ -167,3 +167,12 @@ Rewrite of the transparent‑bridge idea from [`oldhui-uk/tftbridge`](https://gi
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Fork additions
+
+- **Fan speed:** when the `[fan]` speed changes in Klipper (slicer `M106`, macros), the bridge sends `M106 P0 S<n>` so the TFT fan gauge follows. The controller fan (`M710`) is not reported.
+- **`M117` / `display_status` messages:** shown on the TFT as an `echo:` notification. Needs `[display_status]` in `printer.cfg`.
+- **Serial retry:** if the screen's serial port can't be opened at start-up, it is retried every 5 s.
+- **Other TFT models (TFT24/28/35, V1-V3):** the module is model-independent. Use the TFT's own firmware and `config.ini` with the same settings: Marlin mode, Touch Mode, the baud rate you set in `tft_baud`, and host `M155` auto-report enabled.
+- **Not covered:** switching the screen off when the printer is off (oldhui-uk/tftbridge#9) needs a relay or GPIO, which Klipper can switch with `[output_pin]`; the module can't do it by itself.
+
