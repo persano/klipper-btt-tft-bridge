@@ -19,21 +19,148 @@
 # Replaces the transparent oldhui-uk tftbridge.
 
 import logging
+import os
 import serial
+import subprocess
+import threading
 
 
 # Marlin settings/query commands the TFT sends from its menus that Klipper has
 # no equivalent for. Acked quietly instead of showing an "Unknown command"
 # error toast on the screen.
 QUIET_ACK = frozenset(
-    'M22 M33 M36 M43 M92 M98 M125 M141 M154 M200 M201 M203 M205 M206 M207 '
-    'M208 M209 M211 M218 M291 M292 M300 M301 M304 M306 M355 M376 M408 M409 '
-    'M500 M501 M502 M503 M552 M564 M569 M593 M665 M666 M710 M876 M906 M913 '
+    'M22 M33 M36 M43 M92 M98 M125 M141 M154 M200 M201 M203 M206 M208 '
+    'M209 M211 M218 M291 M292 M300 M301 M304 M306 M355 M376 M408 M409 '
+    'M501 M502 M503 M552 M564 M569 M593 M665 M666 M710 M876 M906 M913 '
     'M914 M928'.split())
 
 # M280 P0 S<angle> servo angles the TFT BLTouch menu uses -> BLTOUCH_DEBUG.
 BLTOUCH_ANGLES = {10: 'pin_down', 60: 'touch_mode', 90: 'pin_up',
                   120: 'reset', 130: 'self_test'}
+
+
+class WifiBridgeManager:
+    """Non-blocking Wi-Fi manager for M980-M982 RPC using nmcli in background threads."""
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.reactor = bridge.reactor
+        self.busy = False
+
+    def handle_m980_status(self):
+        if self.busy:
+            self.bridge.send_line("ok")
+            return
+        self.busy = True
+        threading.Thread(target=self._status_worker, daemon=True).start()
+
+    def _status_worker(self):
+        lines = []
+        try:
+            out = subprocess.check_output(
+                ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+                text=True, timeout=5
+            )
+            ssid = ""
+            for row in out.splitlines():
+                if row.startswith("yes:"):
+                    ssid = row.split(":", 1)[1].replace("\\:", ":")
+                    break
+
+            ip_out = subprocess.check_output(
+                ["hostname", "-I"], text=True, timeout=3
+            ).strip()
+            ip_addr = ip_out.split()[0] if ip_out else "0.0.0.0"
+
+            connected = "1" if ssid else "0"
+            lines.append(f"//bridge:wifi_status:{connected}|{ip_addr}|{ssid}")
+        except Exception:
+            lines.append("//bridge:wifi_status:0|0.0.0.0|")
+
+        self.reactor.register_async_callback(lambda e: self._finish(lines))
+
+    def handle_m981_scan(self):
+        if self.busy:
+            self.bridge.send_line("ok")
+            return
+        self.busy = True
+        self.bridge.start_busy_keepalive()
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        lines = []
+        try:
+            cmd = [
+                "nmcli", "-t", "-f", "SIGNAL,SECURITY,SSID",
+                "dev", "wifi", "list", "--rescan", "yes"
+            ]
+            out = subprocess.check_output(cmd, text=True, timeout=12)
+            seen = set()
+            for row in out.splitlines():
+                parts = row.split(":", 2)
+                if len(parts) == 3:
+                    sig = parts[0].strip()
+                    sec = parts[1].strip()
+                    ssid = parts[2].replace("\\:", ":").strip()
+                    if ssid and ssid not in seen:
+                        seen.add(ssid)
+                        sec_flag = "1" if sec and sec != "--" else "0"
+                        lines.append(f"//bridge:wifi_ap:{sig}|{sec_flag}|{ssid}")
+                        if len(seen) >= 16:
+                            break
+        except Exception as exc:
+            lines.append(f"//bridge:wifi_err:{str(exc)[:32]}")
+        lines.append("//bridge:wifi_scan_done")
+        self.reactor.register_async_callback(lambda e: self._finish(lines))
+
+    def handle_m982_connect(self, params_str):
+        if self.busy:
+            self.bridge.send_line("ok")
+            return
+        hex_ssid = ""
+        hex_pass = ""
+        for token in params_str.split():
+            if token.upper().startswith("S"):
+                hex_ssid = token[1:]
+            elif token.upper().startswith("P"):
+                hex_pass = token[1:]
+        try:
+            ssid = bytes.fromhex(hex_ssid).decode("utf-8")
+            password = bytes.fromhex(hex_pass).decode("utf-8") if hex_pass else ""
+        except Exception:
+            self.bridge.send_line("//bridge:wifi_conn:0|Invalid Hex")
+            self.bridge.send_line("ok")
+            return
+
+        self.busy = True
+        self.bridge.start_busy_keepalive()
+        threading.Thread(
+            target=self._connect_worker, args=(ssid, password), daemon=True
+        ).start()
+
+    def _connect_worker(self, ssid, password):
+        lines = []
+        try:
+            cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+            if password:
+                cmd += ["password", password]
+            subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=25)
+            ip_out = subprocess.check_output(["hostname", "-I"], text=True, timeout=3).strip()
+            ip_addr = ip_out.split()[0] if ip_out else "Connected"
+            lines.append(f"//bridge:wifi_conn:1|{ip_addr}")
+        except subprocess.CalledProcessError as exc:
+            err_msg = (exc.output or "Connect failed").strip().splitlines()[-1][:36]
+            lines.append(f"//bridge:wifi_conn:0|{err_msg}")
+        except Exception as exc:
+            lines.append(f"//bridge:wifi_conn:0|{str(exc)[:36]}")
+
+        self.reactor.register_async_callback(lambda e: self._finish(lines))
+
+    def _finish(self, lines):
+        self.bridge.stop_busy_keepalive()
+        for line in lines:
+            self.bridge.send_line(line)
+        self.bridge.send_line("ok")
+        self.busy = False
 
 
 class TftBridge:
@@ -56,6 +183,9 @@ class TftBridge:
         self.machine_type = config.get('machine_type', 'Ender-3')
 
         self.gcode = self.printer.lookup_object('gcode')
+
+        self.wifi_manager = WifiBridgeManager(self)
+        self.selected_vsd_file = None
 
         self.tft = None
         self.fd_handle = None
@@ -153,6 +283,17 @@ class TftBridge:
             return
         logging.debug("TFTBridge ->TFT: %r", data)
 
+    def send_line(self, line):
+        self._send(line + '\r\n')
+
+    def start_busy_keepalive(self):
+        self.reactor.update_timer(
+            self.busy_timer,
+            self.reactor.monotonic() + self.busy_interval)
+
+    def stop_busy_keepalive(self):
+        self.reactor.update_timer(self.busy_timer, self.reactor.NEVER)
+
     def _relay_klipper_output(self, msg):
         # Relay Klipper-originated messages (//, !!, data lines) to the TFT
         # terminal. Drop bare "ok" lines: this bridge emits exactly one ok per
@@ -209,7 +350,7 @@ class TftBridge:
         cmd = text.split(' ', 1)[0].upper()
         logging.debug("TFTBridge TFT->: %s", text)
 
-        # --- local status: answered immediately, never queued ---
+        # --- local status / RPC / Virtual SD: answered immediately ---
         if cmd == 'M105':
             self._send(self._temp_report(with_ok=True))
             return
@@ -235,6 +376,37 @@ class TftBridge:
                 # Query -> report current value (a bare M220/M221 forwarded to
                 # Klipper would reset the factor to 100%).
                 self._send(self._factor_report(cmd))
+            return
+
+        # --- Custom RPC block (M980-M989) ---
+        if cmd == 'M980':
+            self.wifi_manager.handle_m980_status()
+            return
+        if cmd == 'M981':
+            self.wifi_manager.handle_m981_scan()
+            return
+        if cmd == 'M982':
+            self.wifi_manager.handle_m982_connect(text)
+            return
+        if cmd == 'M985':
+            self._handle_m985_macros()
+            return
+        if cmd == 'M986':
+            self._handle_m986_params()
+            return
+        if cmd == 'M987':
+            self._handle_m987_thumb(text)
+            return
+
+        # --- Virtual SD card handling (M20, M21, M23) ---
+        if cmd == 'M20':
+            self._handle_m20_files()
+            return
+        if cmd == 'M21':
+            self._send('SD card ok\r\nok\r\n')
+            return
+        if cmd == 'M23':
+            self._handle_m23_open(text)
             return
 
         # --- quietly acked: Klipper has no equivalent / no-op ---
@@ -267,6 +439,10 @@ class TftBridge:
                 return 'SET_GCODE_OFFSET Z=0'
             return 'SET_GCODE_OFFSET Z=%.3f MOVE=0' % z
         if cmd == 'M24':
+            if self.selected_vsd_file:
+                f = self.selected_vsd_file
+                self.selected_vsd_file = None
+                return 'SDCARD_PRINT_FILE FILENAME="%s"' % f
             return 'RESUME'
         if cmd == 'M25':
             return 'PAUSE'
@@ -281,7 +457,8 @@ class TftBridge:
         if cmd == 'M280':
             # BLTouch menu. Other servos have no Klipper equivalent.
             angle = self._param(text, 'S')
-            action = BLTOUCH_ANGLES.get(int(angle)) if angle is not None                 else None
+            action = BLTOUCH_ANGLES.get(int(angle)) if angle is not None \
+                else None
             if self._param(text, 'P') == 0. and action:
                 return 'BLTOUCH_DEBUG COMMAND=%s' % action
             return ''
@@ -300,14 +477,156 @@ class TftBridge:
             target = self._param(text, 'S')
             if target is None:
                 return ''
-            heater = 'heater_bed' if self._param(text, 'E') == -1.                 else 'extruder'
+            heater = 'heater_bed' if self._param(text, 'E') == -1. \
+                else 'extruder'
             return 'PID_CALIBRATE HEATER=%s TARGET=%d' % (heater, target)
         if cmd == 'M900':
             k = self._param(text, 'K')
             if k is None:
                 return ''
             return 'SET_PRESSURE_ADVANCE ADVANCE=%.4f' % k
+        if cmd == 'M204':
+            # Acceleration
+            accel = self._param(text, 'P')
+            if accel is None:
+                accel = self._param(text, 'S')
+            if accel is None:
+                accel = self._param(text, 'T')
+            if accel is not None:
+                return 'SET_VELOCITY_LIMIT ACCEL=%d' % int(accel)
+            return ''
+        if cmd == 'M205':
+            # Jerk / Square Corner Velocity
+            x = self._param(text, 'X')
+            if x is not None:
+                return 'SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=%.2f' % x
+            return ''
+        if cmd == 'M207':
+            # Firmware Retraction
+            s = self._param(text, 'S')
+            f = self._param(text, 'F')
+            z = self._param(text, 'Z')
+            parts = []
+            if s is not None:
+                parts.append('RETRACT_LENGTH=%.2f' % s)
+            if f is not None:
+                parts.append('RETRACT_SPEED=%.2f' % (f / 60.))
+            if z is not None:
+                parts.append('Z_HOP=%.2f' % z)
+            return ('SET_RETRACTION ' + ' '.join(parts)) if parts else ''
+        if cmd == 'M500':
+            return 'SAVE_CONFIG'
+        if cmd == 'RESTART':
+            return 'RESTART'
+        if cmd == 'FIRMWARE_RESTART':
+            return 'FIRMWARE_RESTART'
         return None
+
+    def _handle_m985_macros(self):
+        macros = []
+        try:
+            for name, _ in self.printer.lookup_objects("gcode_macro"):
+                parts = name.split()
+                if len(parts) > 1 and not parts[1].startswith("_"):
+                    macros.append(parts[1])
+            macros.sort()
+        except Exception:
+            pass
+        for m in macros:
+            self.send_line(f"//bridge:macro:{m}")
+        self.send_line("//bridge:macro_done")
+        self.send_line("ok")
+
+    def _handle_m986_params(self):
+        now = self.reactor.monotonic()
+        pa = 0.0
+        accel = 0
+        scv = 0.0
+        zoff = 0.0
+        try:
+            ext = self.printer.lookup_object('extruder', None)
+            if ext is not None:
+                pa = float(ext.get_status(now).get('pressure_advance', 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            th = self.printer.lookup_object('toolhead', None)
+            if th is not None:
+                st = th.get_status(now)
+                accel = int(st.get('max_accel', 0) or 0)
+                scv = float(st.get('square_corner_velocity', 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            gm = self.printer.lookup_object('gcode_move', None)
+            if gm is not None:
+                st = gm.get_status(now)
+                ho = st.get('homing_origin', [0., 0., 0., 0.])
+                zoff = float(ho[2] if len(ho) > 2 else 0.0)
+        except Exception:
+            pass
+        self.send_line(f"//bridge:klipper_params:PA={pa:.4f}|ACCEL={accel}|SCV={scv:.2f}|ZOFF={zoff:.3f}")
+        self.send_line("ok")
+
+    def _handle_m987_thumb(self, text):
+        hex_filename = ""
+        for token in text.split()[1:]:
+            if token.upper().startswith("S"):
+                hex_filename = token[1:]
+                break
+        try:
+            filename = bytes.fromhex(hex_filename).decode("utf-8")
+        except Exception:
+            filename = ""
+        vsd = self.printer.lookup_object('virtual_sdcard', None)
+        if vsd is not None and hasattr(vsd, 'sdcard_dirname') and filename:
+            filepath = os.path.join(vsd.sdcard_dirname, filename)
+            if os.path.isfile(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        in_thumb = False
+                        count = 0
+                        for line in f:
+                            s = line.strip()
+                            if s.startswith(';00460046') or s.startswith(';simage:') or s.startswith(';gimage:'):
+                                in_thumb = True
+                            if in_thumb:
+                                self.send_line(f"//bridge:thumb:{s}")
+                                count += 1
+                                if count > 300:
+                                    break
+                                if s.endswith(';') and len(s) < 5:
+                                    break
+                except Exception:
+                    pass
+        self.send_line("//bridge:thumb_done")
+        self.send_line("ok")
+
+    def _handle_m20_files(self):
+        vsd = self.printer.lookup_object('virtual_sdcard', None)
+        self.send_line("Begin file list")
+        if vsd is not None and hasattr(vsd, 'sdcard_dirname'):
+            gcode_dir = vsd.sdcard_dirname
+            if os.path.isdir(gcode_dir):
+                for root, dirs, files in os.walk(gcode_dir):
+                    for file in files:
+                        if file.lower().endswith(('.gcode', '.gco', '.g')):
+                            full_p = os.path.join(root, file)
+                            rel_p = os.path.relpath(full_p, gcode_dir).replace('\\', '/')
+                            try:
+                                fsize = os.path.getsize(full_p)
+                            except Exception:
+                                fsize = 0
+                            self.send_line(f"{rel_p} {fsize} /{rel_p}")
+        self.send_line("End file list")
+        self.send_line("ok")
+
+    def _handle_m23_open(self, text):
+        parts = text.split(None, 1)
+        filename = parts[1].strip().strip('"') if len(parts) > 1 else ''
+        self.selected_vsd_file = filename
+        self.send_line(f"File opened: {filename} Size: 0")
+        self.send_line("ok")
 
     # ------------------------------------------------------------------ #
     # Serialized command pump

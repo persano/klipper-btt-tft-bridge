@@ -38,6 +38,7 @@ print('ok progress')
 
 # Marlin -> Klipper translations of commands the TFT menus emit
 t = tftbridge.TftBridge.__new__(tftbridge.TftBridge)
+t.selected_vsd_file = None
 for line, want in [
         ('M290 Z0.05', 'SET_GCODE_OFFSET Z_ADJUST=0.050 MOVE=1'),
         ('M280 P0 S10', 'BLTOUCH_DEBUG COMMAND=pin_down'),
@@ -47,8 +48,22 @@ for line, want in [
         ('M303 E-1 S60 C8', 'PID_CALIBRATE HEATER=heater_bed TARGET=60'),
         ('M303 E0 S200', 'PID_CALIBRATE HEATER=extruder TARGET=200'),
         ('M900 K0.05', 'SET_PRESSURE_ADVANCE ADVANCE=0.0500'),
+        ('M204 P1500', 'SET_VELOCITY_LIMIT ACCEL=1500'),
+        ('M204 S2000', 'SET_VELOCITY_LIMIT ACCEL=2000'),
+        ('M205 X8', 'SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=8.00'),
+        ('M207 S0.8 F1800 Z0.2', 'SET_RETRACTION RETRACT_LENGTH=0.80 RETRACT_SPEED=30.00 Z_HOP=0.20'),
+        ('M500', 'SAVE_CONFIG'),
+        ('RESTART', 'RESTART'),
+        ('FIRMWARE_RESTART', 'FIRMWARE_RESTART'),
+        ('M24', 'RESUME'),
         ('M104 S200', None)]:
     got = t._translate(line.split()[0], line)
     assert got == want, (line, got)
+t.selected_vsd_file = 'test.gcode'
+assert t._translate('M24', 'M24') == 'SDCARD_PRINT_FILE FILENAME="test.gcode"'
 assert 'M203' in tftbridge.QUIET_ACK
+assert 'M204' not in tftbridge.QUIET_ACK
+assert 'M205' not in tftbridge.QUIET_ACK
+assert 'M207' not in tftbridge.QUIET_ACK
+assert 'M500' not in tftbridge.QUIET_ACK
 print('ok translate')
