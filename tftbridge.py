@@ -623,9 +623,19 @@ class TftBridge:
 
     def _handle_m23_open(self, text):
         parts = text.split(None, 1)
-        filename = parts[1].strip().strip('"') if len(parts) > 1 else ''
+        filename = parts[1].strip().strip('"').lstrip('/') if len(parts) > 1 else ''
         self.selected_vsd_file = filename
-        self.send_line(f"File opened: {filename} Size: 0")
+        fsize = 0
+        vsd = self.printer.lookup_object('virtual_sdcard', None)
+        if vsd is not None and hasattr(vsd, 'sdcard_dirname') and filename:
+            filepath = os.path.join(vsd.sdcard_dirname, filename)
+            if os.path.isfile(filepath):
+                try:
+                    fsize = os.path.getsize(filepath)
+                except Exception:
+                    fsize = 0
+        self.send_line(f"File opened: {filename} Size: {fsize}")
+        self.send_line("File selected")
         self.send_line("ok")
 
     # ------------------------------------------------------------------ #
