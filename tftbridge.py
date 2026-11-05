@@ -23,6 +23,7 @@ import glob
 import io
 import logging
 import os
+import re
 import serial
 import struct
 import subprocess
@@ -381,6 +382,8 @@ class TftBridge:
         self.cmd_queue = []
         self.processing = False
         self.output_hooked = False
+        self.vsd_alias_to_real = {}
+        self.vsd_real_to_alias = {}
 
         self.autoreport_interval = 0.
         self.autoreport_timer = self.reactor.register_timer(
@@ -667,6 +670,13 @@ class TftBridge:
             return 'RESUME'
         if cmd == 'M25':
             return 'PAUSE'
+        if cmd == 'M33':
+            parts = text.split(None, 1)
+            raw = parts[1].strip().strip('"').lstrip('/') if len(parts) > 1 else ''
+            real = self.vsd_alias_to_real.get(raw.lower(), raw)
+            self.send_line(f"/{real}")
+            self.send_line("ok")
+            return ''
         if cmd == 'M524':
             return 'CANCEL_PRINT'
         if cmd == 'M290':
@@ -801,6 +811,7 @@ class TftBridge:
         except Exception:
             filename = hex_filename
         filename = filename.lstrip('/\\').replace('\\', '/')
+        filename = self.vsd_alias_to_real.get(filename.lower(), filename)
         vsd = self.printer.lookup_object('virtual_sdcard', None)
         lines = None
         if vsd is not None and hasattr(vsd, 'sdcard_dirname') and filename:
@@ -874,11 +885,14 @@ class TftBridge:
     def _handle_m20_files(self):
         vsd = self.printer.lookup_object('virtual_sdcard', None)
         self.send_line("Begin file list")
+        self.vsd_alias_to_real.clear()
+        self.vsd_real_to_alias.clear()
         if vsd is not None and hasattr(vsd, 'sdcard_dirname'):
             gcode_dir = vsd.sdcard_dirname
             if os.path.isdir(gcode_dir):
+                idx = 1
                 for root, dirs, files in os.walk(gcode_dir):
-                    for file in files:
+                    for file in sorted(files):
                         if file.lower().endswith(('.gcode', '.gco', '.g')):
                             full_p = os.path.join(root, file)
                             rel_p = os.path.relpath(full_p, gcode_dir).replace('\\', '/')
@@ -886,13 +900,33 @@ class TftBridge:
                                 fsize = os.path.getsize(full_p)
                             except Exception:
                                 fsize = 0
-                            self.send_line(f"{rel_p} {fsize} /{rel_p}")
+
+                            base_no_ext, ext = os.path.splitext(file)
+                            if ' ' in file or len(base_no_ext) > 8 or len(ext) > 4:
+                                clean_name = re.sub(r'[^A-Za-z0-9]', '', base_no_ext).upper()[:4]
+                                if not clean_name:
+                                    clean_name = "MKS"
+                                alias = f"{clean_name}{idx:04d}.GCO"
+                            else:
+                                alias = file.upper()
+
+                            sub_dir = os.path.dirname(rel_p)
+                            alias_rel = f"{sub_dir}/{alias}" if sub_dir else alias
+
+                            self.vsd_alias_to_real[alias.lower()] = rel_p
+                            self.vsd_alias_to_real[alias_rel.lower()] = rel_p
+                            self.vsd_alias_to_real[rel_p.lower()] = rel_p
+                            self.vsd_real_to_alias[rel_p.lower()] = alias_rel
+
+                            self.send_line(f"{alias_rel} {fsize} /{rel_p}")
+                            idx += 1
         self.send_line("End file list")
         self.send_line("ok")
 
     def _handle_m23_open(self, text):
         parts = text.split(None, 1)
-        filename = parts[1].strip().strip('"').lstrip('/') if len(parts) > 1 else ''
+        raw_name = parts[1].strip().strip('"').lstrip('/') if len(parts) > 1 else ''
+        filename = self.vsd_alias_to_real.get(raw_name.lower(), raw_name)
         self.selected_vsd_file = filename
         fsize = 0
         vsd = self.printer.lookup_object('virtual_sdcard', None)
