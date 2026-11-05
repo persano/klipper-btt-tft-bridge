@@ -45,15 +45,17 @@ class WifiBridgeManager:
         self.bridge = bridge
         self.reactor = bridge.reactor
         self.busy = False
+        self.last_status = None
 
-    def handle_m980_status(self):
+    def handle_m980_status(self, send_ok=True):
         if self.busy:
-            self.bridge.send_line("ok")
+            if send_ok:
+                self.bridge.send_line("ok")
             return
         self.busy = True
-        threading.Thread(target=self._status_worker, daemon=True).start()
+        threading.Thread(target=self._status_worker, args=(send_ok,), daemon=True).start()
 
-    def _status_worker(self):
+    def _status_worker(self, send_ok=True):
         lines = []
         try:
             out = subprocess.check_output(
@@ -71,12 +73,21 @@ class WifiBridgeManager:
             ).strip()
             ip_addr = ip_out.split()[0] if ip_out else "0.0.0.0"
 
-            connected = "1" if ssid else "0"
-            lines.append(f"//bridge:wifi_status:{connected}|{ip_addr}|{ssid}")
+            if ip_addr and ip_addr != "0.0.0.0":
+                connected = "1"
+                if not ssid:
+                    ssid = "Ethernet"
+            else:
+                connected = "1" if ssid else "0"
+
+            status_line = f"//bridge:wifi_status:{connected}|{ip_addr}|{ssid}"
+            lines.append(status_line)
+            lines.append(f"M118 P0 IP:{ip_addr}")
+            self.last_status = status_line
         except Exception:
             lines.append("//bridge:wifi_status:0|0.0.0.0|")
 
-        self.reactor.register_async_callback(lambda e: self._finish(lines))
+        self.reactor.register_async_callback(lambda e: self._finish(lines, send_ok))
 
     def handle_m981_scan(self):
         if self.busy:
@@ -155,11 +166,12 @@ class WifiBridgeManager:
 
         self.reactor.register_async_callback(lambda e: self._finish(lines))
 
-    def _finish(self, lines):
+    def _finish(self, lines, send_ok=True):
         self.bridge.stop_busy_keepalive()
         for line in lines:
             self.bridge.send_line(line)
-        self.bridge.send_line("ok")
+        if send_ok:
+            self.bridge.send_line("ok")
         self.busy = False
 
 
@@ -250,6 +262,7 @@ class TftBridge:
         self.progress_sent = None
         self.reactor.update_timer(self.printwatch_timer,
                                   self.reactor.monotonic() + 1.)
+        self.wifi_manager.handle_m980_status(send_ok=False)
         logging.info("TFTBridge: ready, listening on %s", self.tft_device)
 
     def _handle_disconnect(self):
@@ -374,6 +387,10 @@ class TftBridge:
         if cmd == 'M115':
             logging.info("TFTBridge: M115 capabilities query from TFT")
             self._send(self._m115_report())
+            self.wifi_manager.handle_m980_status(send_ok=False)
+            return
+        if cmd in ('M524', 'CANCEL_PRINT'):
+            self._handle_cancel()
             return
         if cmd == 'M155':
             self._set_autoreport(text)
@@ -436,6 +453,18 @@ class TftBridge:
 
         # --- everything else: forward verbatim ---
         self.cmd_queue.append(text)
+
+    def _handle_cancel(self):
+        self.selected_vsd_file = None
+        self.start_busy_keepalive()
+        try:
+            self.gcode.run_script('CANCEL_PRINT')
+        except Exception as e:
+            logging.warning("TFTBridge: CANCEL_PRINT failed: %s", e)
+        finally:
+            self.stop_busy_keepalive()
+        self._send('//action:cancel\r\nNot SD printing\r\nok\r\n')
+        self.print_state = 'standby'
 
     def _translate(self, cmd, text):
         if cmd == 'M999':
@@ -801,9 +830,14 @@ class TftBridge:
                 self._send('File opened: %s Size: %d\r\n' % (name, size))
                 logging.info("TFTBridge: print start -> File opened: %s "
                              "Size: %d", name, size)
-            elif state == 'complete' and prev in ('printing', 'paused'):
-                self._send('Done printing file\r\n')
-                logging.info("TFTBridge: print complete -> Done printing file")
+            elif state in ('complete', 'cancelled', 'standby') and prev in ('printing', 'paused'):
+                self.selected_vsd_file = None
+                if state == 'complete':
+                    self._send('Done printing file\r\n')
+                    logging.info("TFTBridge: print complete -> Done printing file")
+                else:
+                    self._send('//action:cancel\r\nNot SD printing\r\n')
+                    logging.info("TFTBridge: print %s -> //action:cancel Not SD printing", state)
         return eventtime + 1.
 
     def _report_fan_and_message(self):
