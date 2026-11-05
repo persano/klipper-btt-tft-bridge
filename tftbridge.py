@@ -281,7 +281,7 @@ class TftBridge:
         except Exception:
             logging.exception("TFTBridge: write failed")
             return
-        logging.debug("TFTBridge ->TFT: %r", data)
+        logging.info("TFTBridge ->TFT: %r", data)
 
     def send_line(self, line):
         self._send(line + '\r\n')
@@ -310,7 +310,18 @@ class TftBridge:
         try:
             data = self.tft.read(256)
         except Exception:
-            logging.exception("TFTBridge: read failed")
+            logging.exception("TFTBridge: read failed, disconnecting and scheduling reconnect")
+            if self.fd_handle is not None:
+                self.reactor.unregister_fd(self.fd_handle)
+                self.fd_handle = None
+            if self.tft is not None:
+                try:
+                    self.tft.close()
+                except Exception:
+                    pass
+                self.tft = None
+            self.reactor.update_timer(self.reconnect_timer,
+                                      self.reactor.monotonic() + 1.)
             return
         if not data:
             return
@@ -348,7 +359,7 @@ class TftBridge:
         if not text:
             return
         cmd = text.split(' ', 1)[0].upper()
-        logging.debug("TFTBridge TFT->: %s", text)
+        logging.info("TFTBridge TFT->: %s", text)
 
         # --- local status / RPC / Virtual SD: answered immediately ---
         if cmd == 'M105':
@@ -427,6 +438,10 @@ class TftBridge:
         self.cmd_queue.append(text)
 
     def _translate(self, cmd, text):
+        if cmd == 'M999':
+            return 'FIRMWARE_RESTART'
+        if cmd in ('FIRMWARE_RESTART', 'RESTART'):
+            return cmd
         if cmd == 'G29':
             return 'BED_MESH_CALIBRATE'
         if cmd == 'M420':
@@ -704,7 +719,7 @@ class TftBridge:
     def _temp_report(self, with_ok):
         t, tt = self._heater('extruder')
         b, bt = self._heater('heater_bed')
-        body = 'T:%.1f /%.1f B:%.1f /%.1f @:0 B@:0' % (t, tt, b, bt)
+        body = 'T:%.1f /%.1f B:%.1f /%.1f T0:%.1f /%.1f @:0 B@:0' % (t, tt, b, bt, t, tt)
         return ('ok %s\r\n' % body) if with_ok else ('%s\r\n' % body)
 
     def _position_report(self):
@@ -841,7 +856,7 @@ class TftBridge:
 
     def _m115_report(self):
         caps = [
-            'FIRMWARE_NAME:Marlin 2.1.2 (Klipper bridge) '
+            'FIRMWARE_NAME:Klipper (via TFT bridge) '
             'SOURCE_CODE_URL:github.com/bigtreetech/BIGTREETECH-TouchScreenFirmware '
             'PROTOCOL_VERSION:1.0 MACHINE_TYPE:%s EXTRUDER_COUNT:1 '
             'UUID:00000000-0000-0000-0000-000000000000' % self.machine_type,
