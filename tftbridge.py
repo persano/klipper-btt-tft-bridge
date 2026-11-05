@@ -181,6 +181,176 @@ class WifiBridgeManager:
         self.busy = False
 
 
+def decode_png_fallback(png_bytes):
+    if not png_bytes or not png_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+        return None
+    idx = 8
+    width = height = bit_depth = color_type = 0
+    idat_parts = []
+    palette = None
+    while idx < len(png_bytes):
+        if idx + 8 > len(png_bytes):
+            break
+        length, chunk_type = struct.unpack('>I4s', png_bytes[idx:idx+8])
+        idx += 8
+        if idx + length > len(png_bytes):
+            break
+        chunk_data = png_bytes[idx:idx+length]
+        idx += length + 4
+        if chunk_type == b'IHDR':
+            width, height, bit_depth, color_type = struct.unpack('>IIBB', chunk_data[:10])
+        elif chunk_type == b'PLTE':
+            palette = chunk_data
+        elif chunk_type == b'IDAT':
+            idat_parts.append(chunk_data)
+        elif chunk_type == b'IEND':
+            break
+
+    if not idat_parts or width == 0 or height == 0:
+        return None
+
+    try:
+        raw_data = zlib.decompress(b''.join(idat_parts))
+    except Exception:
+        return None
+
+    bpp_map = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+    if color_type not in bpp_map or bit_depth != 8:
+        return None
+    bpp = bpp_map[color_type]
+    stride = width * bpp
+    rows = []
+    raw_idx = 0
+    prev_row = bytearray(stride)
+    for _ in range(height):
+        if raw_idx >= len(raw_data):
+            break
+        filter_type = raw_data[raw_idx]
+        raw_idx += 1
+        scanline = bytearray(raw_data[raw_idx:raw_idx+stride])
+        raw_idx += stride
+        if filter_type == 0:
+            pass
+        elif filter_type == 1:
+            for x in range(bpp, stride):
+                scanline[x] = (scanline[x] + scanline[x - bpp]) & 0xFF
+        elif filter_type == 2:
+            for x in range(stride):
+                scanline[x] = (scanline[x] + prev_row[x]) & 0xFF
+        elif filter_type == 3:
+            for x in range(stride):
+                left = scanline[x - bpp] if x >= bpp else 0
+                scanline[x] = (scanline[x] + ((left + prev_row[x]) >> 1)) & 0xFF
+        elif filter_type == 4:
+            for x in range(stride):
+                a = scanline[x - bpp] if x >= bpp else 0
+                b = prev_row[x]
+                c = prev_row[x - bpp] if x >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                scanline[x] = (scanline[x] + pr) & 0xFF
+        prev_row = scanline
+        rows.append(scanline)
+    return width, height, color_type, rows, palette
+
+def render_70x70_rgb565(w, h, ctype, rows, palette=None):
+    target_w, target_h = 70, 70
+    lines = ['00460046']
+    bg_r, bg_g, bg_b = 30, 30, 30
+    for ty in range(target_h):
+        row_hex = []
+        sy = int(ty * h / target_h)
+        scanline = rows[sy]
+        for tx in range(target_w):
+            sx = int(tx * w / target_w)
+            if ctype == 6:
+                r, g, b, a = scanline[sx*4:sx*4+4]
+                if a == 0:
+                    r, g, b = bg_r, bg_g, bg_b
+                elif a < 255:
+                    alpha = a / 255.0
+                    r = int(r * alpha + bg_r * (1.0 - alpha))
+                    g = int(g * alpha + bg_g * (1.0 - alpha))
+                    b = int(b * alpha + bg_b * (1.0 - alpha))
+            elif ctype == 2:
+                r, g, b = scanline[sx*3:sx*3+3]
+            elif ctype == 3 and palette:
+                pidx = scanline[sx] * 3
+                r, g, b = palette[pidx:pidx+3]
+            elif ctype == 0:
+                r = g = b = scanline[sx]
+            else:
+                r = g = b = 0
+            rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            row_hex.append(f'{rgb565:04X}')
+        lines.append(''.join(row_hex))
+    return lines
+
+def render_png_to_70x70(png_bytes):
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(png_bytes)).convert('RGBA')
+        resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else getattr(Image, 'ANTIALIAS', Image.BILINEAR)
+        im = im.resize((70, 70), resample)
+        pixels = list(im.getdata())
+        lines = ['00460046']
+        bg_r, bg_g, bg_b = 30, 30, 30
+        for y in range(70):
+            row_hex = []
+            for x in range(70):
+                r, g, b, a = pixels[y * 70 + x]
+                if a == 0:
+                    r, g, b = bg_r, bg_g, bg_b
+                elif a < 255:
+                    alpha = a / 255.0
+                    r = int(r * alpha + bg_r * (1.0 - alpha))
+                    g = int(g * alpha + bg_g * (1.0 - alpha))
+                    b = int(b * alpha + bg_b * (1.0 - alpha))
+                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                row_hex.append(f'{rgb565:04X}')
+            lines.append(''.join(row_hex))
+        return lines
+    except Exception:
+        pass
+    decoded = decode_png_fallback(png_bytes)
+    if decoded:
+        w, h, ctype, rows, pal = decoded
+        return render_70x70_rgb565(w, h, ctype, rows, pal)
+    return None
+
+def extract_gcode_png(filepath):
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            in_b64 = False
+            b64_lines = []
+            best_png = None
+            for idx, line in enumerate(f):
+                if idx > 4000:
+                    break
+                s = line.strip()
+                if not in_b64:
+                    if s.startswith('; thumbnail begin'):
+                        in_b64 = True
+                        b64_lines = []
+                else:
+                    if s.startswith('; thumbnail end'):
+                        in_b64 = False
+                        try:
+                            data = base64.b64decode(''.join(b64_lines))
+                            if data.startswith(b'\x89PNG\r\n\x1a\n'):
+                                best_png = data
+                        except Exception:
+                            pass
+                    else:
+                        if s.startswith(';'):
+                            s = s[1:].strip()
+                        b64_lines.append(s)
+            return best_png
+    except Exception:
+        return None
+
+
 class TftBridge:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -619,175 +789,6 @@ class TftBridge:
         self.send_line(f"//bridge:klipper_params:PA={pa:.4f}|ACCEL={accel}|SCV={scv:.2f}|ZOFF={zoff:.3f}")
         self.send_line("ok")
 
-
-def decode_png_fallback(png_bytes):
-    if not png_bytes or not png_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-        return None
-    idx = 8
-    width = height = bit_depth = color_type = 0
-    idat_parts = []
-    palette = None
-    while idx < len(png_bytes):
-        if idx + 8 > len(png_bytes):
-            break
-        length, chunk_type = struct.unpack('>I4s', png_bytes[idx:idx+8])
-        idx += 8
-        if idx + length > len(png_bytes):
-            break
-        chunk_data = png_bytes[idx:idx+length]
-        idx += length + 4
-        if chunk_type == b'IHDR':
-            width, height, bit_depth, color_type = struct.unpack('>IIBB', chunk_data[:10])
-        elif chunk_type == b'PLTE':
-            palette = chunk_data
-        elif chunk_type == b'IDAT':
-            idat_parts.append(chunk_data)
-        elif chunk_type == b'IEND':
-            break
-
-    if not idat_parts or width == 0 or height == 0:
-        return None
-
-    try:
-        raw_data = zlib.decompress(b''.join(idat_parts))
-    except Exception:
-        return None
-
-    bpp_map = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
-    if color_type not in bpp_map or bit_depth != 8:
-        return None
-    bpp = bpp_map[color_type]
-    stride = width * bpp
-    rows = []
-    raw_idx = 0
-    prev_row = bytearray(stride)
-    for _ in range(height):
-        if raw_idx >= len(raw_data):
-            break
-        filter_type = raw_data[raw_idx]
-        raw_idx += 1
-        scanline = bytearray(raw_data[raw_idx:raw_idx+stride])
-        raw_idx += stride
-        if filter_type == 0:
-            pass
-        elif filter_type == 1:
-            for x in range(bpp, stride):
-                scanline[x] = (scanline[x] + scanline[x - bpp]) & 0xFF
-        elif filter_type == 2:
-            for x in range(stride):
-                scanline[x] = (scanline[x] + prev_row[x]) & 0xFF
-        elif filter_type == 3:
-            for x in range(stride):
-                left = scanline[x - bpp] if x >= bpp else 0
-                scanline[x] = (scanline[x] + ((left + prev_row[x]) >> 1)) & 0xFF
-        elif filter_type == 4:
-            for x in range(stride):
-                a = scanline[x - bpp] if x >= bpp else 0
-                b = prev_row[x]
-                c = prev_row[x - bpp] if x >= bpp else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                scanline[x] = (scanline[x] + pr) & 0xFF
-        prev_row = scanline
-        rows.append(scanline)
-    return width, height, color_type, rows, palette
-
-def render_70x70_rgb565(w, h, ctype, rows, palette=None):
-    target_w, target_h = 70, 70
-    lines = ['00460046']
-    bg_r, bg_g, bg_b = 30, 30, 30
-    for ty in range(target_h):
-        row_hex = []
-        sy = int(ty * h / target_h)
-        scanline = rows[sy]
-        for tx in range(target_w):
-            sx = int(tx * w / target_w)
-            if ctype == 6:
-                r, g, b, a = scanline[sx*4:sx*4+4]
-                if a == 0:
-                    r, g, b = bg_r, bg_g, bg_b
-                elif a < 255:
-                    alpha = a / 255.0
-                    r = int(r * alpha + bg_r * (1.0 - alpha))
-                    g = int(g * alpha + bg_g * (1.0 - alpha))
-                    b = int(b * alpha + bg_b * (1.0 - alpha))
-            elif ctype == 2:
-                r, g, b = scanline[sx*3:sx*3+3]
-            elif ctype == 3 and palette:
-                pidx = scanline[sx] * 3
-                r, g, b = palette[pidx:pidx+3]
-            elif ctype == 0:
-                r = g = b = scanline[sx]
-            else:
-                r = g = b = 0
-            rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            row_hex.append(f'{rgb565:04X}')
-        lines.append(''.join(row_hex))
-    return lines
-
-def render_png_to_70x70(png_bytes):
-    try:
-        from PIL import Image
-        im = Image.open(io.BytesIO(png_bytes)).convert('RGBA')
-        resample = getattr(Image, 'Resampling', Image).LANCZOS if hasattr(Image, 'Resampling') else getattr(Image, 'ANTIALIAS', Image.BILINEAR)
-        im = im.resize((70, 70), resample)
-        pixels = list(im.getdata())
-        lines = ['00460046']
-        bg_r, bg_g, bg_b = 30, 30, 30
-        for y in range(70):
-            row_hex = []
-            for x in range(70):
-                r, g, b, a = pixels[y * 70 + x]
-                if a == 0:
-                    r, g, b = bg_r, bg_g, bg_b
-                elif a < 255:
-                    alpha = a / 255.0
-                    r = int(r * alpha + bg_r * (1.0 - alpha))
-                    g = int(g * alpha + bg_g * (1.0 - alpha))
-                    b = int(b * alpha + bg_b * (1.0 - alpha))
-                rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                row_hex.append(f'{rgb565:04X}')
-            lines.append(''.join(row_hex))
-        return lines
-    except Exception:
-        pass
-    decoded = decode_png_fallback(png_bytes)
-    if decoded:
-        w, h, ctype, rows, pal = decoded
-        return render_70x70_rgb565(w, h, ctype, rows, pal)
-    return None
-
-def extract_gcode_png(filepath):
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            in_b64 = False
-            b64_lines = []
-            best_png = None
-            for idx, line in enumerate(f):
-                if idx > 4000:
-                    break
-                s = line.strip()
-                if not in_b64:
-                    if s.startswith('; thumbnail begin'):
-                        in_b64 = True
-                        b64_lines = []
-                else:
-                    if s.startswith('; thumbnail end'):
-                        in_b64 = False
-                        try:
-                            data = base64.b64decode(''.join(b64_lines))
-                            if data.startswith(b'\x89PNG\r\n\x1a\n'):
-                                best_png = data
-                        except Exception:
-                            pass
-                    else:
-                        if s.startswith(';'):
-                            s = s[1:].strip()
-                        b64_lines.append(s)
-            return best_png
-    except Exception:
-        return None
 
     def _handle_m987_thumb(self, text):
         hex_filename = ""
