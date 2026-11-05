@@ -621,7 +621,7 @@ class TftBridge:
         try:
             filename = bytes.fromhex(hex_filename).decode("utf-8")
         except Exception:
-            filename = ""
+            filename = hex_filename
         vsd = self.printer.lookup_object('virtual_sdcard', None)
         if vsd is not None and hasattr(vsd, 'sdcard_dirname') and filename:
             filepath = os.path.join(vsd.sdcard_dirname, filename)
@@ -632,14 +632,17 @@ class TftBridge:
                         count = 0
                         for line in f:
                             s = line.strip()
-                            if s.startswith(';00460046') or s.startswith(';simage:') or s.startswith(';gimage:'):
-                                in_thumb = True
+                            if not in_thumb:
+                                if s.startswith(';00460046') or s.startswith(';simage:') or s.startswith(';gimage:'):
+                                    in_thumb = True
                             if in_thumb:
+                                if not s:
+                                    continue
+                                if count > 0 and len(s) < 20 and (s.startswith(';00') or s.startswith(';simage:') or s.startswith(';gimage:')):
+                                    break
                                 self.send_line(f"//bridge:thumb:{s}")
                                 count += 1
-                                if count > 300:
-                                    break
-                                if s.endswith(';') and len(s) < 5:
+                                if count >= 71 or (s.endswith(';') and len(s) < 5 and count > 1):
                                     break
                 except Exception:
                     pass
