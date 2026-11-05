@@ -1,191 +1,137 @@
 # klipper-btt-tft-bridge
 
-A **Klipper `extras` module** that runs a **BigTreeTech TFT** (TFT35 E3 V3 and friends) in full **Touch Mode** against Klipper — **including host‑initiated print progress**: prints started from Mainsail/Fluidd show up on the TFT with a live progress bar.
+A high-performance **Klipper `extras` module** that runs **BigTreeTech and MKS TouchScreens** in full native **Touch Mode** against Klipper with complete bidirectional RPC support — including **virtual SD card file browsing, on-screen G-code thumbnail streaming, Wi-Fi provisioning, macro discovery, live tuning, and host print progress**.
 
-It fixes the two problems everyone hits when wiring a BTT TFT to a Klipper machine:
-
-1. **`ACK timed out` / `pending gcode released`** spam (especially during prints).
-2. **No print status on the TFT** when the print is started from the host (Mainsail/Fluidd).
-
-> As far as we could find, no public solution covered the full Touch‑Mode experience **with host print progress** — most guides stop at "use the 12864 emulation menu" or "use KlipperScreen instead". This does the real thing.
+Paired with the dedicated screen firmware fork: [**BIGTREETECH-TouchScreenFirmware-Klipper**](https://github.com/persano/BIGTREETECH-TouchScreenFirmware-Klipper).
 
 ---
 
-## How it's different from existing bridges
+## 📊 Why Use This Bridge? (Feature Comparison)
 
-Transparent bridges (e.g. `oldhui-uk/tftbridge`, plain `socat` to `/tmp/printer`) just shuttle bytes between the TFT and Klipper. That breaks because:
-
-- The BTT TFT speaks **Marlin** and expects Marlin‑shaped replies and timing.
-- A naive bridge often sends an extra `ok` **and** lets Klipper send its own → **double `ok` → ACK desync → `ACK timed out`**.
-- Klipper rejects Marlin‑only commands (`M92`, `M211`, `M420`, …) with `!! Unknown command`, which the TFT treats as an error.
-- Long commands (`G28`, heating, bed mesh) don't return `ok` for many seconds → the TFT's hard ~5 s ACK timeout fires.
-- Nothing ever tells the TFT that a **host** print is running, so it never shows progress.
-
-This module is a **Marlin‑compatibility layer** that runs *inside* Klippy and answers the TFT the way it expects.
-
----
-
-## Features
-
-- **In‑process** Klipper `extras` module — no extra daemon, no `socat`, no `/tmp/printer` pty round‑trip.
-- **Single‑threaded** via `reactor.register_fd` (the same mechanism Klipper uses for its own serial) — no thread races.
-- **Local, instant status replies** straight from Klipper's object model: `M105` (temps), `M114` (position), `M220`/`M221` (feed/flow), `M27` (SD status). These never enter the gcode queue, so the status loop no longer fights print/motion traffic.
-- **Exactly one `ok` per command** — kills the double‑ack that causes `ACK timed out`.
-- **`echo:busy: processing` keepalive** during long commands (`G28`, `M109/M190`, bed mesh) so the TFT never times out waiting.
-- **`M155` temperature auto‑report** — temps keep updating even while a long command runs.
-- **`M115`** advertises a Marlin firmware name and the capabilities the TFT needs (`AUTOREPORT_TEMP:1`, `SDCARD:1`, `AUTOREPORT_SD_STATUS:0`).
-- **Host print progress** — detects a print start from `print_stats`, tells the TFT (`File opened: …`), which makes the TFT open its print screen and poll `M27` (answered with live `SD printing byte X/Y`).
-- **Marlin → Klipper translations**: `G29`→`BED_MESH_CALIBRATE`, `M420 S1`→`BED_MESH_PROFILE LOAD=default` / else `BED_MESH_CLEAR`, `M851 Z`→`SET_GCODE_OFFSET`, `M24`/`M25`/`M524`→`RESUME`/`PAUSE`/`CANCEL_PRINT`.
-- **Garbage‑byte tolerant** — the TFT occasionally injects junk bytes (e.g. `0xFD`) before a command; the bridge decodes with `errors='ignore'` and never forwards raw junk into Klipper (a naive bridge crashes on the UTF‑8 decode here).
+| Feature | Transparent Passthrough (socat / naive bridge) | **klipper-btt-tft-bridge (This Module)** |
+| :--- | :--- | :--- |
+| **Architecture** | External user daemon shuttling raw bytes | **In-process Klipper `extras`** running inside Klippy event reactor |
+| **Serial Synchronization** | Double `ok` collisions cause fatal **`ACK timed out`** | **Strict single `ok` invariant**; status queries never enter gcode queue |
+| **Long Commands (`G28`, Bed Mesh, Heating)** | Screen locks up / times out after 5 seconds | Emits **`echo:busy: processing`** keepalives; screen stays responsive |
+| **Host-Started Print Tracking** | ❌ None (screen stays on idle menu) | ✅ Emits **`File opened:`** and live `M27` byte progress from `print_stats` |
+| **Virtual SD Card File Browsing** | ❌ Empty list or broken short 8.3 aliases | ✅ **Full real filenames** from Mainsail/Fluidd with folder traversal (`M20 L`) |
+| **G-code Thumbnail Streaming** | ❌ None (blank document icons only) | ✅ **Live 70x70 RGB565 thumbnail streaming** from Moonraker `.thumbs/` or G-code (`M987`) |
+| **On-Screen Wi-Fi Management** | ❌ None | ✅ **Live Wi-Fi scanning (`M981`) and connection (`M982`)** via on-screen keyboard |
+| **Klipper Macro Discovery** | ❌ Hardcoded Marlin buttons only | ✅ **Dynamic enumeration (`M985`)** of all public `[gcode_macro]` objects |
+| **Klipper Live Parameter Tuning** | ❌ Marlin codes fail (`M900`, `M205` rejected) | ✅ **Pressure Advance, Square Corner Velocity, Accel, Retract (`M986`)** |
+| **Host Control & Recovery** | ❌ None | ✅ Direct **`SAVE_CONFIG`**, **`RESTART`**, and **`FIRMWARE_RESTART`** (recovers MCU shutdown) |
 
 ---
 
-## Topology / wiring
+## Key Capabilities
+
+### 1. In-Process Single-Threaded Architecture
+Runs inside the Klippy process using `reactor.register_fd` (same mechanism Klipper uses for microcontrollers). Status commands (`M105`, `M114`, `M220`, `M221`, `M27`) are answered instantly from Klipper's internal object model without going through the G-code execution queue.
+
+### 2. Virtual SD Card File Manager (`M20 L`, `M21`, `M23`, `M24`)
+- Reads files directly from Klipper's `virtual_sdcard` directory.
+- Sends full long filenames (`Cap:LONG_FILENAME:1`) and file sizes.
+- Supports subdirectories and clean folder navigation on the touchscreen.
+- Tapping a file selects it via `M23` and prints via `M24` directly from the display.
+
+### 3. High-Speed G-Code Thumbnail Streaming (`M987` & `//bridge:thumb:`)
+- When the screen requests a thumbnail (`M987 S<hex_filename>`), the bridge locates the file in `virtual_sdcard`.
+- Checks Moonraker `.thumbs/` (e.g. `300x300.png`, `48x48.png`, `32x32.png`), embedded G-code Base64 PNGs, or Cura image comments.
+- Resizes to 70x70 RGB565 with alpha blending over a dark neutral background.
+- Streams the pixel data to the screen via `//bridge:thumb:<row_hex>` lines.
+- Paired with the screen firmware's dedicated SPI flash cache (`0x7C0000`), preview is instant on tap and persists across cancel.
+
+### 4. On-Screen Wi-Fi Provisioning (`M980`–`M982`)
+- `M980`: Returns current host Wi-Fi connection status, SSID, and IP address.
+- `M981`: Scans nearby access points with signal strength and encryption type.
+- `M982`: Connects to a selected SSID using the password entered on the TFT's ASCII keyboard (via NetworkManager or `wpa_supplicant`).
+
+### 5. Dynamic Klipper Macro Enumeration (`M985`)
+- Queries Klipper's config object for all defined `[gcode_macro]` objects (filtering out internal/hidden macros prefixed with `_`).
+- Transmits macro names to the TFT, which displays them in a scrollable list with one-tap execution.
+
+### 6. Klipper Parameter Tuning (`M986`)
+Translates touchscreen live adjustments to native Klipper commands:
+- **Pressure Advance** → `SET_PRESSURE_ADVANCE ADVANCE=...`
+- **Square Corner Velocity** → `SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=...`
+- **Max Acceleration** → `SET_VELOCITY_LIMIT ACCEL=...`
+- **Firmware Retraction** → `SET_RETRACTION RETRACT_LENGTH=...`
+- **Probe Z-Offset** → `SET_GCODE_OFFSET Z_ADJUST=... MOVE=1`
+
+### 7. Bidirectional Print Progress & Host Actions
+- Automatically notifies the TFT when a print starts from Mainsail/Fluidd.
+- Streams live progress percentage, elapsed time, and remaining time (`Time Left ..`, `Data Left ..`).
+- Forwards `M117` and `[display_status]` messages to the TFT status bar.
+- Syncs part cooling fan speed gauge (`M106`).
+
+---
+
+## Topology & Wiring
 
 ```
-BTT TFT (Touch Mode)  --UART/TTL-->  USB-TTL adapter (CH340/CP2102/FTDI)  --USB-->  Raspberry Pi (Klipper + Moonraker)
-SKR / mainboard       ------------------------------------------------------USB-->  Raspberry Pi
+BTT / MKS TFT (Touch Mode)  --UART/TTL (3.3V)-->  USB-TTL adapter (CH340/CP2102)  --USB-->  Host SBC (Raspberry Pi)
+Printer Mainboard (SKR, etc.) --------------------------------------------------------USB-->  Host SBC (Raspberry Pi)
 ```
 
-The TFT is **not** wired to the mainboard's TFT port. It's a plain serial device on the Pi, e.g. `/dev/serial/by-id/usb-1a86_USB_Serial-...`.
+The TFT connects to a USB-TTL serial adapter plugged into the Raspberry Pi (or host SBC), **not** the mainboard TFT port.
 
-> ⚠️ The BTT TFT "RS232" connector is **TTL 3.3 V**, not real RS‑232. Use a plain USB‑TTL adapter. Do **not** put a real RS‑232 (±12 V, e.g. MAX3232) converter in the path — it will garble or destroy the signal.
+> ⚠️ **Voltage Warning:** The TFT serial port operates at **3.3V TTL**. Do **NOT** connect RS-232 voltage (±12V); use a standard 3.3V USB-TTL adapter (CH340, CP2102, FT232R).
 
 ---
 
-## Install
+## Installation
 
-Quick way: `git clone` this repo on the Pi and run `./install.sh [klipper_dir]`. It symlinks the module and adds the git exclude below, so `git pull` updates it. If the serial adapter is not ready when Klipper starts, the bridge retries opening it every 5 s.
-
-### 1. Klipper module
-Copy `tftbridge.py` to your Klipper extras folder:
+### 1. Clone & Link
+On your Raspberry Pi:
 ```bash
-cp tftbridge.py ~/klipper/klippy/extras/
+cd ~
+git clone https://github.com/persano/klipper-btt-tft-bridge.git
+cd klipper-btt-tft-bridge
+./install.sh
 ```
 
-### 2. `printer.cfg`
+### 2. Configure `printer.cfg`
+Add the `[tftbridge]` section to your `printer.cfg`:
 ```ini
 [tftbridge]
-tft_device: /dev/serial/by-id/usb-XXXXXXXX   # your USB-TTL adapter (ls /dev/serial/by-id/)
+tft_device: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0   # Find via: ls /dev/serial/by-id/
 tft_baud: 115200
 # optional:
-# busy_interval: 2.0      # seconds between "busy: processing" keepalives
-# machine_type: Ender-3   # reported in M115
-```
-You also need the standard Mainsail/Fluidd objects (usually already present):
-```ini
+# busy_interval: 2.0      # Seconds between keepalive echoes
+# machine_type: GeniusPro # Machine name reported in M115
+
 [virtual_sdcard]
-[print_stats]
+path: ~/printer_data/gcodes
+
 [display_status]
 [pause_resume]
+[print_stats]
 ```
 
-### 3. TFT `config.ini` (on the TFT's microSD)
-Set these keys, put the file on the SD card root, boot the TFT once to apply (it renames `config.ini` → `config.ini.CUR`):
+### 3. Screen Firmware Configuration (`config.ini`)
+In your TFT's `config.ini` on the SD card:
 ```ini
-serial_port:P1:6        # 115200 — must match tft_baud
+serial_port:P1:6          # 115200 baud (must match tft_baud)
 command_checksum:0
-onboard_sd:1            # REQUIRED for print progress (see below)
+onboard_sd:1              # Enables virtual SD card mode and host print tracking
 M27_always_active:1
 M27_refresh_time:2
-prog_source:0           # file-position based progress %
+prog_source:0             # File-position based progress %
+long_filename:1           # Enable long filename support
 ```
 
-### 4. Apply
+### 4. Restart Klipper
 ```bash
 sudo systemctl restart klipper
 ```
-Then **power‑cycle the TFT** so it re‑reads `config.ini` and re‑runs its `M115` handshake.
 
 ---
 
-## Keeping Klipper's git repo clean (avoid the `-dirty` flag)
+## Updates via Moonraker (Mainsail / Fluidd Web UI)
 
-Copying `tftbridge.py` into `klippy/extras/` adds an **untracked file** to Klipper's git repo, so Moonraker reports the Klipper version as `…-dirty` and its update manager may refuse to auto-update Klipper. Tell git to ignore the module locally:
+Add this entry to your `moonraker.conf` so update notifications appear directly in Mainsail/Fluidd:
 
-```bash
-echo 'klippy/extras/tftbridge.py' >> ~/klipper/.git/info/exclude
-```
-
-Also keep any backup copies (`tftbridge.py.bak`, …) **outside** `klippy/extras/` — leftover files there dirty the repo the same way.
-
----
-
-## The part nobody documents: host print progress
-
-The TFT only polls `M27` once it *believes a print is active* — and `M27_always_active` does **not** make it poll while idle (despite the name; it means "also poll for prints not started from the TFT").
-
-So the bridge has to actively kick the TFT into print mode. From the firmware source (`Mainboard_AckHandler.c`):
-
-- An unsolicited line `File opened: <name> Size: <bytes>` triggers `startPrintingFromRemoteHost()` — **gated on `onboardSD == ENABLED`** (hence `onboard_sd:1` is mandatory). The TFT opens its print screen and calls `request_M27()`.
-- From then on the TFT polls `M27`, which the bridge answers with `SD printing byte <pos>/<size>` (and `Done printing file` on completion).
-
-The bridge watches `print_stats.state` on a 1 s timer and emits `File opened:` on the `→ printing` transition. That's the whole trick.
-
----
-
-## Command handling
-
-| From TFT | Bridge does |
-|---|---|
-| `M105` | local temps: `ok T:.. /.. B:.. /.. @:0 B@:0` |
-| `M114` | local position from `gcode_move` |
-| `M220` / `M221` (no `S`) | local current feed/flow factor |
-| `M220 S` / `M221 S` | forwarded (Klipper supports these natively) |
-| `M27` | local SD/print status |
-| `M115` | local Marlin capability report |
-| `M155 S<n>` | starts/stops local temperature auto‑report |
-| `M92`, `M211`, `M500`‑`M503` | quietly acked (no‑op) |
-| `G29` | → `BED_MESH_CALIBRATE` |
-| `M420 S1` / else | → `BED_MESH_PROFILE LOAD=default` / `BED_MESH_CLEAR` |
-| `M851 Z<v>` | → `SET_GCODE_OFFSET Z=<v> MOVE=0` |
-| `M24` / `M25` / `M524` | → `RESUME` / `PAUSE` / `CANCEL_PRINT` |
-| everything else | `gcode.run_script(...)`, then one `ok`; long commands get `busy: processing` keepalives |
-
----
-
-## Known limitations
-
-- **Klipper host restart** (`systemctl restart klipper`, or saving the config in Mainsail) drops the serial for ~9 s, which is longer than the TFT's hard ~5 s ACK timeout → the TFT shows a modal `ACK timed out` that you must dismiss with **OK**. Restarting just the **printer/MCU** is fine (the klippy host process stays up, the bridge keeps the port). A fully restart‑proof version would run the bridge as a separate process holding the port independently of Klipper — contributions welcome.
-- The TFT's on‑board SD **file browser** is empty — the files live in Klipper's `virtual_sdcard`. Start prints from Mainsail/Fluidd; the TFT mirrors status and gives pause/resume/cancel.
-
----
-
-## Tested on
-
-- Ender 3 Pro · SKR Mini E3 V3 · Klipper `v0.13` · Raspberry Pi Zero 2 W
-- BTT **TFT35 E3 V3.0 (GD)** in Touch Mode · CH340 USB‑TTL @ 115200
-
-Other BTT TFTs (TFT24/28/35/43/50, V3) in Touch Mode should work the same way — please report results.
-
----
-
-## Credits
-
-Rewrite of the transparent‑bridge idea from [`oldhui-uk/tftbridge`](https://github.com/oldhui-uk/tftbridge), turned into a full Marlin‑compatibility layer. TFT firmware behaviour reverse‑engineered from [`BIGTREETECH-TouchScreenFirmware`](https://github.com/bigtreetech/BIGTREETECH-TouchScreenFirmware) source (`Printing.c`, `Mainboard_AckHandler.c`).
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-## Fork additions
-
-- **Fan speed:** when the `[fan]` speed changes in Klipper (slicer `M106`, macros), the bridge sends `M106 P0 S<n>` so the TFT fan gauge follows. The controller fan (`M710`) is not reported.
-- **`M117` / `display_status` messages:** shown on the TFT as an `echo:` notification. Needs `[display_status]` in `printer.cfg`.
-- **Serial retry:** if the screen's serial port can't be opened at start-up, it is retried every 5 s.
-- **Other TFT models (TFT24/28/35, V1-V3):** the module is model-independent. Use the TFT's own firmware and `config.ini` with the same settings: Marlin mode, Touch Mode, the baud rate you set in `tft_baud`, and host `M155` auto-report enabled.
-- **Not covered:** switching the screen off when the printer is off (oldhui-uk/tftbridge#9) needs a relay or GPIO, which Klipper can switch with `[output_pin]`; the module can't do it by itself.
-- **Time left / data left:** while printing, the bridge sends `//action:notification Time Left ..` and `Data Left ..` (the same host actions [btt-tft-postprocess](https://github.com/persano/btt-tft-postprocess) injects for Marlin hosts), so those tiles fill without editing the gcode. The estimate is linear in file position, so it is rough early in a print. Thumbnails still need the file itself, which this bridge does not stream.
-- **Screen firmware:** for the Artillery Genius Pro's MKS GD TFT28 (GD32F305), a build with serial/notification fixes is in [persano/BIGTREETECH-TFT](https://github.com/persano/BIGTREETECH-TFT) (branch `btt-tft28-GD32F305-artillery-genius-pro`).
-- **Commands translated from the TFT menus:** `M290` (babystep, `SET_GCODE_OFFSET Z_ADJUST`), `M280 P0 S<angle>`, `M401`, `M402` (BLTouch menu, `BLTOUCH_DEBUG`), `M48` (`PROBE_ACCURACY`), `M303` (PID autotune: `PID_CALIBRATE`, then run `SAVE_CONFIG`), `M900` (`SET_PRESSURE_ADVANCE`). Settings/query commands Klipper has no equivalent for (`M203`, `M205`, `M569`, ...) are acked quietly instead of showing an "Unknown command" toast.
-- **Macros:** `examples/macros.cfg.example` has `M81` (power off) and `M600` (filament change) for commands the TFT sends that Klipper does not know.
-- **Not supported:** `G30` (the TFT's manual-leveling points), `G26`, `G33`/`G34`, `G42`, `M421` and the TMC/RepRap-specific commands still reach Klipper and show an error on the screen.
-
-## Updates from Mainsail / Fluidd
-
-Clone the repo, run `./install.sh`, then add this to `moonraker.conf` so the update manager shows it in the web UI and restarts Klipper after an update:
-
-```
+```ini
 [update_manager klipper-btt-tft-bridge]
 type: git_repo
 path: ~/klipper-btt-tft-bridge
@@ -194,5 +140,23 @@ primary_branch: main
 managed_services: klipper
 ```
 
-With two Klipper instances sharing one clone, add it to one Moonraker only and use the matching `klipper-<name>` service in `managed_services`.
+---
+
+## Paired Screen Firmware
+
+For the best experience, use our matching firmware:
+👉 [**BIGTREETECH-TouchScreenFirmware-Klipper**](https://github.com/persano/BIGTREETECH-TouchScreenFirmware-Klipper)
+
+Features include:
+- SD-less instant boot for Artillery Genius Pro / Sidewinder X2 (`PB15` hardware detect + NVIC fix).
+- Dedicated 5-slot SPI flash thumbnail cache (`0x7C0000`) for zero-latency scroll and instant popup previews.
+- Upfront flash sector erase preventing UART buffer overrun during thumbnail streaming.
+- Word-wrapping print confirmation popup with model thumbnail preview.
+- Turnkey SD packages for Artillery Genius Pro and other popular printers.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
 

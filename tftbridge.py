@@ -1166,6 +1166,7 @@ class TftBridge:
             'Cap:TOGGLE_LIGHTS:0',
             'Cap:EMERGENCY_PARSER:1',
             'Cap:CHAMBER_TEMPERATURE:0',
+            'Cap:LONG_FILENAME:1',
             'ok',
         ]
         return '\r\n'.join(caps) + '\r\n'
