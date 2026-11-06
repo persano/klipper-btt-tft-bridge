@@ -802,10 +802,12 @@ class TftBridge:
 
     def _handle_m987_thumb(self, text):
         hex_filename = ""
+        slot_token = None
         for token in text.split()[1:]:
             if token.upper().startswith("S"):
                 hex_filename = token[1:]
-                break
+            elif token.upper().startswith("P"):
+                slot_token = token[1:]
         try:
             filename = bytes.fromhex(hex_filename).decode("utf-8", errors="ignore")
         except Exception:
@@ -879,7 +881,10 @@ class TftBridge:
             for l in lines:
                 self.send_line(f"//bridge:thumb:{l}")
                 time.sleep(0.002)
-        self.send_line("//bridge:thumb_done")
+        if slot_token is not None:
+            self.send_line(f"//bridge:thumb_done:{slot_token}")
+        else:
+            self.send_line("//bridge:thumb_done")
         self.send_line("ok")
 
     def _handle_m20_files(self):
